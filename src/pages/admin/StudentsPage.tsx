@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react'
 import { motion } from 'framer-motion'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
+import { createClient } from '@supabase/supabase-js'
 import { useAuth } from '@/contexts/AuthContext'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -93,6 +94,10 @@ const StudentDialog: React.FC<StudentDialogProps> = ({ open, onClose, student, s
   }, [open, reset])
 
   const onSubmit = async (data: StudentForm) => {
+    if (!schoolId) {
+      alert("Error: Your admin account is not linked to a school. Please register a new school.")
+      return
+    }
     if (isEdit && student) {
       // Update profile
       // @ts-expect-error type missing
@@ -113,15 +118,43 @@ const StudentDialog: React.FC<StudentDialogProps> = ({ open, onClose, student, s
       } as any).eq('id', student.id)
     } else {
       // Create auth user
-      const email = `student_${data.roll_number}_${Date.now()}@${schoolId}.byte`
-      const { data: authData, error } = await supabase.auth.admin.createUser({
-        email, password: 'ChangeMe@123', email_confirm: true,
-        user_metadata: { full_name: data.full_name, role: 'student', school_id: schoolId }
-      }).catch(() => ({ data: null, error: { message: 'Use service role key for user creation' } }))
+      const tempClient = createClient(
+        import.meta.env.VITE_SUPABASE_URL,
+        import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+        { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }
+      )
+      
+      const email = data.parent_email || `student_${data.roll_number}_${Date.now()}@${schoolId}.byte`
+      const { data: authData, error } = await tempClient.auth.signUp({
+        email, password: 'ChangeMe@123',
+        options: {
+          data: { full_name: data.full_name, role: 'student', school_id: schoolId }
+        }
+      })
 
-      if (error || !authData?.user) {
-        // Fallback: just insert student record placeholder
-        console.warn('Student creation requires service role key. Record saved locally.')
+      if (error) {
+        alert("Auth Error: " + error.message)
+        return
+      }
+
+      if (!authData?.user) {
+        console.error('Failed to create student user:', error)
+      } else {
+        // Insert extra student fields
+        await supabase.from('students').insert({
+          id: authData.user.id,
+          school_id: schoolId,
+          section_id: data.section_id || null,
+          roll_number: data.roll_number,
+          admission_number: data.admission_number,
+          gender: data.gender,
+          date_of_birth: data.date_of_birth || null,
+          blood_group: data.blood_group,
+          parent_name: data.parent_name,
+          parent_mobile: data.parent_mobile,
+          parent_email: data.parent_email,
+          address: data.address,
+        } as any)
       }
     }
     await qc.invalidateQueries({ queryKey: ['students'] })
@@ -216,9 +249,12 @@ const StudentDialog: React.FC<StudentDialogProps> = ({ open, onClose, student, s
 }
 
 // ─── CSV Import Dialog ────────────────────────────────────────────────────────
-const CsvImportDialog: React.FC<{ open: boolean; onClose: () => void }> = ({ open, onClose }) => {
+const CsvImportDialog: React.FC<{ open: boolean; onClose: () => void; schoolId: string }> = ({ open, onClose, schoolId }) => {
   const [rows, setRows] = useState<Array<Record<string, string>>>([])
   const [errors, setErrors] = useState<string[]>([])
+  const [importing, setImporting] = useState(false)
+  const [importLog, setImportLog] = useState<string[]>([])
+  const fileInputRef = React.useRef<HTMLInputElement>(null)
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
@@ -258,13 +294,22 @@ const CsvImportDialog: React.FC<{ open: boolean; onClose: () => void }> = ({ ope
             <Button variant="outline" size="sm" onClick={downloadSample}><Download size={14} /> Sample CSV</Button>
           </div>
 
-          <div className="border-2 border-dashed border-border rounded-lg p-8 text-center">
+          <div
+            className="border-2 border-dashed border-border rounded-lg p-8 text-center cursor-pointer hover:border-primary/50 transition-colors"
+            onClick={() => fileInputRef.current?.click()}
+          >
             <Upload size={32} className="mx-auto mb-3 text-muted-foreground" />
             <p className="text-sm text-muted-foreground mb-2">Click to select or drag CSV file here</p>
-            <input type="file" accept=".csv" onChange={handleFile} className="hidden" id="csv-input" />
-            <label htmlFor="csv-input">
-              <Button variant="outline" size="sm" asChild><span>Choose File</span></Button>
-            </label>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv"
+              onChange={handleFile}
+              className="hidden"
+            />
+            <Button variant="outline" size="sm" type="button" onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}>
+              Choose File
+            </Button>
           </div>
 
           {errors.map(e => (
@@ -299,11 +344,59 @@ const CsvImportDialog: React.FC<{ open: boolean; onClose: () => void }> = ({ ope
               {rows.length > 5 && <p className="text-xs text-muted-foreground mt-1">...and {rows.length - 5} more rows</p>}
             </div>
           )}
+
+          {importLog.length > 0 && (
+            <div className="mt-3 rounded-md border border-border max-h-32 overflow-y-auto p-2 space-y-1">
+              {importLog.map((line, i) => (
+                <p key={i} className="text-xs font-mono">{line}</p>
+              ))}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button disabled={rows.length === 0}>
-            Import {rows.length} Students
+          <Button
+            disabled={rows.length === 0 || importing}
+            onClick={async () => {
+              setImporting(true)
+              setImportLog([])
+              const log: string[] = []
+              const { createClient: cc } = await import('@supabase/supabase-js')
+              const tempClient = cc(
+                import.meta.env.VITE_SUPABASE_URL,
+                import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+                { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }
+              )
+              for (let i = 0; i < rows.length; i++) {
+                const row = rows[i]
+                const email = `student_${row.roll_no}_${Date.now()}_${i}@byte.local`
+                const { data: authData, error: authErr } = await tempClient.auth.signUp({
+                  email,
+                  password: 'ChangeMe@123',
+                  options: { data: { full_name: row.name, role: 'student', school_id: schoolId } }
+                })
+                if (authErr || !authData?.user) {
+                  log.push(`❌ Row ${i + 1} (${row.name}): Auth failed - ${authErr?.message}`)
+                  continue
+                }
+                const { error: insertErr } = await supabase.from('students').insert({
+                  id: authData.user.id,
+                  school_id: schoolId,
+                  roll_number: row.roll_no,
+                  parent_name: row.parent_name,
+                  parent_mobile: row.parent_mobile,
+                } as any)
+                if (insertErr) {
+                  log.push(`❌ Row ${i + 1} (${row.name}): DB error - ${insertErr.message}`)
+                } else {
+                  log.push(`✅ Row ${i + 1} (${row.name}): Imported!`)
+                }
+              }
+              setImportLog(log)
+              setImporting(false)
+            }}
+          >
+            {importing ? 'Importing...' : `Import ${rows.length} Students`}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -326,7 +419,7 @@ export const StudentsPage: React.FC = () => {
     queryFn: async () => {
       let q = supabase
         .from('students')
-        .select('*, profile:profiles!inner(full_name, email, avatar_url, school_id), section:sections(name, class:classes(name))')
+        .select('*, profile:profiles!inner(full_name, school_id), section:sections(name, class:classes(name))')
         .eq('profile.school_id', schoolId!)
       if (search) q = q.ilike('profile.full_name', `%${search}%`)
       const { data } = await q.order('created_at', { ascending: false })
@@ -480,6 +573,7 @@ export const StudentsPage: React.FC = () => {
       <CsvImportDialog
         open={csvOpen}
         onClose={() => setCsvOpen(false)}
+        schoolId={schoolId ?? ''}
       />
     </div>
   )

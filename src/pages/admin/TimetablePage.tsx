@@ -32,6 +32,9 @@ export const TimetablePage: React.FC = () => {
   const [csvOpen, setCsvOpen] = useState(false)
   const [csvRows, setCsvRows] = useState<CsvRow[]>([])
   const [csvErrors, setCsvErrors] = useState<string[]>([])
+  const [importing, setImporting] = useState(false)
+  const [importLog, setImportLog] = useState<string[]>([])
+  const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   const { data: sections } = useQuery({
     queryKey: ['sections-select', schoolId],
@@ -66,16 +69,17 @@ export const TimetablePage: React.FC = () => {
   const handleCsvFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
+    setImportLog([])
     Papa.parse<CsvRow>(file, {
       header: true,
       skipEmptyLines: true,
       complete: (result) => {
         const required = ['day', 'period', 'start_time', 'end_time', 'subject', 'teacher']
         const missing = required.filter(h => !result.meta.fields?.includes(h))
-        if (missing.length) { setCsvErrors([`Missing: ${missing.join(', ')}`]); return }
+        if (missing.length) { setCsvErrors([`Missing columns: ${missing.join(', ')}`]); return }
         const errs: string[] = []
         result.data.forEach((row, i) => {
-          if (!DAYS.includes(row.day)) errs.push(`Row ${i + 2}: Invalid day "${row.day}"`)
+          if (!DAYS.includes(row.day)) errs.push(`Row ${i + 2}: Invalid day "${row.day}" — must be Monday-Saturday`)
           if (row.start_time >= row.end_time) errs.push(`Row ${i + 2}: start_time must be before end_time`)
         })
         setCsvErrors(errs)
@@ -86,16 +90,67 @@ export const TimetablePage: React.FC = () => {
 
   const importTimetable = async () => {
     if (!selectedSection || csvErrors.length > 0) return
-    // Delete existing first
+    setImporting(true)
+    setImportLog([])
+    const log: string[] = []
+
+    // 1. Fetch all subjects and staff for this school to resolve names → IDs
+    const { data: subjects } = await supabase
+      .from('subjects')
+      .select('id, name')
+      .eq('school_id', schoolId!)
+
+    const { data: staffProfiles } = await supabase
+      .from('profiles')
+      .select('id, full_name')
+      .eq('school_id', schoolId!)
+      .eq('role', 'staff')
+
+    const subjectMap = Object.fromEntries((subjects ?? []).map(s => [s.name.toLowerCase().trim(), s.id]))
+    const staffMap = Object.fromEntries((staffProfiles ?? []).map(s => [s.full_name?.toLowerCase().trim() ?? '', s.id]))
+
+    // 2. Delete existing timetable for this section
     await supabase.from('timetables').delete().eq('section_id', selectedSection)
-    // Build insert rows (subject and staff lookup would happen here)
-    // This is a simplified version - in production you'd resolve subject/staff IDs
+
+    // 3. Insert each row
+    let successCount = 0
+    for (let i = 0; i < csvRows.length; i++) {
+      const row = csvRows[i]
+      const subjectId = subjectMap[row.subject.toLowerCase().trim()]
+      const staffId = staffMap[row.teacher.toLowerCase().trim()]
+
+      if (!subjectId) {
+        log.push(`SKIP Row ${i + 1}: Subject "${row.subject}" not found in DB — add it to Subjects first`)
+        continue
+      }
+
+      const { error } = await supabase.from('timetables').insert({
+        section_id: selectedSection,
+        day_of_week: row.day,
+        period_number: Number(row.period),
+        start_time: row.start_time,
+        end_time: row.end_time,
+        subject_id: subjectId,
+        staff_id: staffId ?? null,
+      } as any)
+
+      if (error) {
+        log.push(`FAIL Row ${i + 1} (${row.day} P${row.period}): ${error.message}`)
+      } else {
+        successCount++
+        log.push(`OK Row ${i + 1} (${row.day} P${row.period} - ${row.subject}): Added`)
+        if (!staffId) log.push(`  NOTE: Teacher "${row.teacher}" not found — period saved without staff assignment`)
+      }
+    }
+
+    log.unshift(`Import complete: ${successCount}/${csvRows.length} periods added`)
+    setImportLog(log)
+    setImporting(false)
     await qc.invalidateQueries({ queryKey: ['timetable'] })
-    setCsvOpen(false)
   }
 
   const downloadTemplate = () => {
-    const csv = 'day,period,start_time,end_time,subject,teacher\nMonday,1,09:00,09:45,Maths,Ramesh\nMonday,2,09:45,10:30,English,Suresh'
+    const csv = 'day,period,start_time,end_time,subject,teacher\nMonday,1,09:00,09:45,Maths,Ramesh Kumar\nMonday,2,09:45,10:30,English,Suresh Babu\nTuesday,1,09:00,09:45,Science,Ramesh Kumar'
     const blob = new Blob([csv], { type: 'text/csv' })
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a'); a.href = url; a.download = 'timetable_template.csv'; a.click()
@@ -185,38 +240,60 @@ export const TimetablePage: React.FC = () => {
           <DialogHeader><DialogTitle>Upload Timetable CSV</DialogTitle></DialogHeader>
           <div className="space-y-4">
             <div className="flex items-center justify-between">
-              <p className="text-sm text-muted-foreground">Upload CSV to replace the existing timetable for this section.</p>
+              <p className="text-sm text-muted-foreground">Replaces existing timetable for this section.</p>
               <Button variant="outline" size="sm" onClick={downloadTemplate}><Download size={14} /> Template</Button>
             </div>
-            <div className="border-2 border-dashed border-border rounded-lg p-8 text-center">
+
+            <div
+              className="border-2 border-dashed border-border rounded-lg p-8 text-center cursor-pointer hover:border-primary/50 transition-colors"
+              onClick={() => fileInputRef.current?.click()}
+            >
               <Upload size={28} className="mx-auto mb-2 text-muted-foreground" />
-              <p className="text-sm text-muted-foreground mb-2">Select CSV file</p>
-              <input type="file" accept=".csv" onChange={handleCsvFile} className="hidden" id="tt-csv" />
-              <label htmlFor="tt-csv"><Button variant="outline" size="sm" asChild><span>Choose File</span></Button></label>
+              <p className="text-sm text-muted-foreground mb-3">Click to select or drag CSV file here</p>
+              <input ref={fileInputRef} type="file" accept=".csv" onChange={handleCsvFile} className="hidden" />
+              <Button variant="outline" size="sm" type="button" onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click() }}>
+                Choose File
+              </Button>
             </div>
+
             {csvErrors.map(e => (
-              <div key={e} className="flex items-center gap-2 rounded-md bg-danger/10 border border-danger/20 px-3 py-2">
-                <AlertCircle size={14} className="text-danger shrink-0" />
-                <p className="text-xs text-danger">{e}</p>
+              <div key={e} className="flex items-center gap-2 rounded-md bg-red-100 border border-red-300 px-3 py-2">
+                <AlertCircle size={14} className="text-red-600 shrink-0" />
+                <p className="text-xs text-red-700">{e}</p>
               </div>
             ))}
+
             {csvRows.length > 0 && csvErrors.length === 0 && (
               <div>
-                <p className="text-sm font-medium text-foreground mb-2">{csvRows.length} periods found</p>
-                <div className="border border-border rounded overflow-hidden max-h-48 overflow-y-auto">
+                <p className="text-sm font-medium text-foreground mb-2">{csvRows.length} periods found — Preview:</p>
+                <div className="border border-border rounded overflow-auto max-h-48">
                   <table className="w-full text-xs">
-                    <thead className="bg-muted/50"><tr>{Object.keys(csvRows[0]).map(h => <th key={h} className="px-3 py-2 text-left text-muted-foreground">{h}</th>)}</tr></thead>
+                    <thead className="bg-muted/50">
+                      <tr>{Object.keys(csvRows[0]).map(h => <th key={h} className="px-3 py-2 text-left text-muted-foreground">{h}</th>)}</tr>
+                    </thead>
                     <tbody className="divide-y divide-border">
                       {csvRows.slice(0, 5).map((r, i) => <tr key={i}>{Object.values(r).map((v, j) => <td key={j} className="px-3 py-1.5 text-foreground">{v}</td>)}</tr>)}
                     </tbody>
                   </table>
                 </div>
+                {csvRows.length > 5 && <p className="text-xs text-muted-foreground mt-1">...and {csvRows.length - 5} more rows</p>}
+              </div>
+            )}
+
+            {importLog.length > 0 && (
+              <div className="rounded-md border border-border max-h-36 overflow-y-auto p-2 space-y-1 bg-muted/30">
+                {importLog.map((line, i) => <p key={i} className="text-xs font-mono">{line}</p>)}
               </div>
             )}
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCsvOpen(false)}>Cancel</Button>
-            <Button disabled={csvRows.length === 0 || csvErrors.length > 0} onClick={importTimetable}>Import Timetable</Button>
+            <Button
+              disabled={csvRows.length === 0 || csvErrors.length > 0 || importing}
+              onClick={importTimetable}
+            >
+              {importing ? 'Importing...' : `Import ${csvRows.length} Periods`}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

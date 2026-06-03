@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { motion } from 'framer-motion'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { supabase } from '@/lib/supabase'
+import { createClient } from '@supabase/supabase-js'
 import { useAuth } from '@/contexts/AuthContext'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -45,23 +46,45 @@ const StaffDialog: React.FC<{ open: boolean; onClose: () => void; schoolId: stri
   React.useEffect(() => { if (!open) reset() }, [open, reset])
 
   const onSubmit = async (data: StaffForm) => {
-    // In production this would use a service-role edge function.
-    // Here we demonstrate the data structure.
-    const { data: authData } = await supabase.auth.signUp({
+    if (!schoolId) {
+      alert("Error: Your admin account is not linked to a school. Please register a new school.")
+      return
+    }
+    // Create a temporary client that DOES NOT persist the session,
+    // so the admin does not get logged out and replaced by the staff member.
+    const tempClient = createClient(
+      import.meta.env.VITE_SUPABASE_URL,
+      import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+      { auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false } }
+    )
+
+    const { data: authData, error: authError } = await tempClient.auth.signUp({
       email: data.email,
       password: 'StaffTemp@123',
       options: {
         data: { full_name: data.full_name, role: 'staff', school_id: schoolId, mobile_number: data.mobile_number }
       }
     })
+    
+    if (authError) {
+      alert("Auth Error: " + authError.message)
+      return
+    }
+
     if (authData?.user) {
-      await supabase.from('staff').insert({
+      const { error: insertError } = await supabase.from('staff').insert({
         id: authData.user.id,
+        school_id: schoolId,
         staff_id: data.staff_id,
         designation: data.designation,
         qualification: data.qualification,
         experience_years: data.experience_years ? Number(data.experience_years) : null,
       } as any)
+      
+      if (insertError) {
+        alert("Database Error: " + insertError.message + "\nDetails: " + insertError.details + "\nHint: " + insertError.hint)
+        console.error("STAFF INSERT ERROR", insertError)
+      }
     }
     await qc.invalidateQueries({ queryKey: ['staff'] })
     onClose()
@@ -128,7 +151,7 @@ export const StaffPage: React.FC = () => {
     queryFn: async () => {
       let q = supabase
         .from('staff')
-        .select('*, profile:profiles!inner(full_name, email, mobile_number, avatar_url, school_id)')
+        .select('*, profile:profiles!inner(full_name, school_id)')
         .eq('profile.school_id', schoolId!)
       if (search) q = q.ilike('profile.full_name', `%${search}%`)
       const { data } = await q
